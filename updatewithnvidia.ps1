@@ -99,21 +99,97 @@ function Get-RandomMessage {
     return ($messages[$Category] | Get-Random)
 }
 
-# ------------------------ Maintenance ------------------------
-Write-Host "[Maintenance] Updating winget sources..."
-try {
-    winget source update
-    Write-Host (Get-RandomMessage "WingetUpdate")
-} catch {
-    Write-Warning (Get-RandomMessage "WingetFail")
+# ------------------------ Robust Winget Maintenance ------------------------
+$WingetLogDir = Join-Path $env:ProgramData "NVIDIA-FastInstall"
+$null = New-Item -ItemType Directory -Path $WingetLogDir -Force -ErrorAction SilentlyContinue
+$WingetLog = Join-Path $WingetLogDir "winget-actions.log"
+
+function Write-WingetLog {
+    param([string]$Text)
+    $ts = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+    $line = "[$ts] $Text"
+    Add-Content -Path $WingetLog -Value $line
+    Write-Host $line
 }
 
-Write-Host "[Maintenance] Upgrading all packages via winget..."
-try {
-    winget upgrade --all --include-unknown --silent --accept-package-agreements --accept-source-agreements
-    Write-Host (Get-RandomMessage "UpgradeDone")
-} catch {
-    Write-Warning (Get-RandomMessage "UpgradeFail")
+function Test-WingetPresent {
+    try {
+        $v = winget --version 2>&1
+        if ($LASTEXITCODE -ne 0) { return $false }
+        Write-WingetLog "winget version: $v"
+        return $true
+    } catch { return $false }
+}
+
+Write-Host "[Maintenance] Checking winget..."
+if (-not (Test-WingetPresent)) {
+    Write-WingetLog "winget not found or not healthy."
+    Write-WingetLog "Tip: Install/Repair 'App Installer' from Microsoft Store (Microsoft.DesktopAppInstaller)."
+    Write-Warning (Get-RandomMessage "WingetFail")
+} else {
+    Write-Host "[Maintenance] Updating winget sources..."
+    try {
+        & winget source update | Tee-Object -FilePath $WingetLog -Append | Out-Host
+        if ($LASTEXITCODE -ne 0) {
+            Write-WingetLog "source update returned code $LASTEXITCODE. Attempting reset..."
+            & winget source reset --force | Tee-Object -FilePath $WingetLog -Append | Out-Host
+            & winget source update | Tee-Object -FilePath $WingetLog -Append | Out-Host
+        }
+        Write-Host (Get-RandomMessage "WingetUpdate")
+    } catch {
+        Write-WingetLog "Exception during source update: $($_.Exception.Message)"
+        Write-Warning (Get-RandomMessage "WingetFail")
+    }
+
+    Write-Host "[Maintenance] Upgrading all packages via winget..."
+    $upgradeCmds = @(
+        @('upgrade','--all','--include-unknown','--silent','--accept-package-agreements','--accept-source-agreements','--disable-interactivity'),
+        @('upgrade','--all','--silent','--accept-package-agreements','--accept-source-agreements','--disable-interactivity'),
+        @('upgrade','--all','--accept-package-agreements','--accept-source-agreements','--disable-interactivity')
+    )
+
+    $success = $false
+    foreach ($args in $upgradeCmds) {
+        Write-WingetLog ("Running: winget {0}" -f ($args -join ' '))
+        try {
+            $p = Start-Process -FilePath "winget" -ArgumentList $args -Wait -PassThru -WindowStyle Hidden `
+                 -RedirectStandardOutput $WingetLog -RedirectStandardError $WingetLog
+            Write-WingetLog "ExitCode: $($p.ExitCode)"
+            if ($p.ExitCode -eq 0) { $success = $true; break }
+        } catch {
+            Write-WingetLog "Exception: $($_.Exception.Message)"
+        }
+    }
+
+    if (-not $success) {
+        Write-WingetLog "Bulk upgrade failed. Falling back to per-package attempt."
+        try {
+            $list = winget upgrade --accept-source-agreements 2>&1
+            $pkgs = $list | Select-String -Pattern '^\S+\s+\S+\s+\S+' | ForEach-Object {
+                ($_ -split '\s+')[0]
+            } | Where-Object { $_ -and $_ -ne 'Name' -and $_ -ne '----' } | Select-Object -Unique
+
+            foreach ($id in $pkgs) {
+                Write-WingetLog "Upgrading: $id"
+                try {
+                    $p = Start-Process -FilePath "winget" `
+                        -ArgumentList @('upgrade','--id',$id,'--silent','--accept-package-agreements','--accept-source-agreements','--disable-interactivity') `
+                        -Wait -PassThru -WindowStyle Hidden -RedirectStandardOutput $WingetLog -RedirectStandardError $WingetLog
+                    Write-WingetLog "  $id -> ExitCode $($p.ExitCode)"
+                } catch {
+                    Write-WingetLog "  $id -> Exception: $($_.Exception.Message)"
+                }
+            }
+        } catch {
+            Write-WingetLog "Per-package fallback failed: $($_.Exception.Message)"
+        }
+    }
+
+    if ($success) {
+        Write-Host (Get-RandomMessage "UpgradeDone")
+    } else {
+        Write-Warning (Get-RandomMessage "UpgradeFail")
+    }
 }
 
 # ------------------------ NVIDIA Install ------------------------
